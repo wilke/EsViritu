@@ -158,6 +158,14 @@ def esviritu():
             This can reduce processing time and provide more accurate abundance estimates.'
         )
     optional_args.add_argument(
+        "--collapse-duplicates",
+        dest="COLLAPSE", type=esvf.str2bool, default=False,
+        help='True or False. Default: False. Map each distinct read (pair) sequence only once and \
+            copy its alignments to every identical read, with that read\'s name and qualities. \
+            Results are the same as without it; mapping is faster when many reads are identical. \
+            Not used for --read_format interleaved.'
+        )
+    optional_args.add_argument(
         "--min-align-length",
         dest="MINAL", type=int, default=100,
         help='Default: 100. Minimum alignment length to pass read-level filter. \
@@ -384,6 +392,15 @@ def esviritu():
                 logger.warning(f"Failed to remove temp directory {args.TEMP_DIR}: {e}")
         sys.exit(1)
 
+    # optionally map each distinct read (pair) only once
+    collapsed = None
+    if args.COLLAPSE:
+        if str(args.READ_FMT) == "interleaved":
+            logger.warning("--collapse-duplicates is not used for interleaved reads")
+        else:
+            collapse_fn = timed_function(logger=logger)(esvf.collapse_identical_reads)
+            collapsed = collapse_fn(trim_filt_reads, str(args.TEMP_DIR), str(args.SAMPLE))
+
     # map reads to virus DB and filter for good alignments
     init_bam_f = os.path.join(str(args.TEMP_DIR), f"{str(args.SAMPLE)}.initial.filt.sorted.bam")
     minimap2_f_fn = timed_function(logger=logger)(esvf.minimap2_f)
@@ -394,7 +411,8 @@ def esviritu():
         init_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL)
+        int(args.MINAL),
+        collapsed
     )
 
     logger.info(f"initial bam: {initial_map_bam}")
@@ -465,7 +483,8 @@ def esviritu():
         sec_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL)
+        int(args.MINAL),
+        collapsed
     )
     require_alignments(second_map_bam, "second")
 
@@ -521,7 +540,8 @@ def esviritu():
         third_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL)
+        int(args.MINAL),
+        collapsed
     )
     require_alignments(third_map_bam, "third")
 

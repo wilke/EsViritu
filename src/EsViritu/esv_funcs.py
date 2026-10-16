@@ -4,6 +4,8 @@ import logging
 import subprocess
 import json
 import tempfile
+import gzip
+import hashlib
 from subprocess import Popen, PIPE, STDOUT
 import sys, os
 import re
@@ -375,9 +377,120 @@ def various_readstats(
     return yaml_readcount_path
 
 
+## collapse identical reads before mapping, expand alignments after it
+
+def _open_text(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "r")
+
+
+def _fastq_records(handle):
+    while True:
+        header = handle.readline()
+        if not header:
+            return
+        seq = handle.readline().rstrip("\n")
+        handle.readline()
+        qual = handle.readline().rstrip("\n")
+        yield header[1:].split(None, 1)[0], seq, qual
+
+
+def collapse_identical_reads(reads: list, tempdir: str, sample_name: str,
+                             reps_per_bucket: int = 100_000) -> dict:
+    """
+    Write one representative per distinct read sequence (or read-pair sequence
+    pair) so it is mapped only once, and keep every read's name and base
+    qualities so expand_collapsed_record() can restore one alignment per read.
+
+    reads: one FASTQ (unpaired) or two (R1, R2), optionally gzipped.
+    Representatives are named by their index (0, 1, ...) in order of first
+    occurrence. The names and qualities of all reads (representative first)
+    are written to bucket files of `reps_per_bucket` representatives each, so
+    memory holds only one hash per distinct read and one bucket at a time.
+
+    Returns a dict for minimap2_f(collapsed=...): reads (representative
+    FASTQs), buckets, reps_per_bucket, paired, n_reads, n_unique.
+    """
+    paired = len(reads) == 2
+    os.makedirs(tempdir, exist_ok=True)
+    out_paths = [os.path.join(tempdir, f"{sample_name}_R{i + 1}.unique.fastq") for i in range(len(reads))]
+    bucket_dir = os.path.join(tempdir, f"{sample_name}_collapsed_reads")
+    os.makedirs(bucket_dir, exist_ok=True)
+    buckets = []
+    rep_of = {}
+    n_reads = 0
+    ins = [_open_text(p) for p in reads]
+    outs = [open(p, "w") for p in out_paths]
+    try:
+        streams = [_fastq_records(h) for h in ins]
+        for recs in zip(*streams):
+            n_reads += 1
+            key = hashlib.blake2b("\n".join(r[1] for r in recs).encode(), digest_size=16).digest()
+            rep = rep_of.get(key)
+            if rep is None:
+                rep = rep_of[key] = len(rep_of)
+                for (_name, seq, qual), out in zip(recs, outs):
+                    out.write(f"@{rep}\n{seq}\n+\n{qual}\n")
+            b = rep // reps_per_bucket
+            while len(buckets) <= b:
+                buckets.append(open(os.path.join(bucket_dir, f"{len(buckets):05d}.tsv"), "w"))
+            name = recs[0][0]
+            if paired and name[-2:] in ("/1", "/2"):
+                name = name[:-2]   # minimap2 strips /1 and /2 from paired read names
+            buckets[b].write(f"{rep}\t{name}\t" + "\t".join(r[2] for r in recs) + "\n")
+        for extra in streams:
+            if next(extra, None) is not None:
+                raise ValueError(f"read files {reads} have different numbers of reads")
+    finally:
+        for h in ins + outs + buckets:
+            h.close()
+    n_unique = len(rep_of)
+    logger.info(f"collapsed {n_reads} reads{' (pairs)' if paired else ''} to {n_unique} distinct sequences "
+                f"({100 * (1 - n_unique / n_reads) if n_reads else 0:.1f}% identical copies)")
+    return {"reads": out_paths, "buckets": [b.name for b in buckets], "reps_per_bucket": reps_per_bucket,
+            "paired": paired, "n_reads": n_reads, "n_unique": n_unique}
+
+
+class _CollapsedMembers:
+    """Name and qualities of every read that a representative stands for; loads one bucket at a time."""
+
+    def __init__(self, collapsed: dict):
+        self.c = collapsed
+        self.loaded = None
+        self.members = {}
+
+    def __call__(self, rep: int) -> list:
+        b = rep // self.c["reps_per_bucket"]
+        if b != self.loaded:
+            self.members = defaultdict(list)
+            with open(self.c["buckets"][b]) as f:
+                for line in f:
+                    fields = line.rstrip("\n").split("\t")
+                    self.members[int(fields[0])].append(fields[1:])
+            self.loaded = b
+        return self.members[rep]
+
+
+def _write_expanded(filtbam, group: list, members: list, paired: bool) -> None:
+    """Write the alignments of one representative once for every read it stands for,
+    with that read's name and base qualities (all records of a read stay adjacent)."""
+    for name, *quals in members:
+        for record in group:
+            record.query_name = name
+            if record.query_qualities is not None:
+                q = quals[1] if (paired and record.is_read2) else quals[0]
+                if record.is_reverse:
+                    q = q[::-1]
+                cig = record.cigartuples or []
+                left = cig[0][1] if cig and cig[0][0] == 5 else 0
+                right = cig[-1][1] if len(cig) > 1 and cig[-1][0] == 5 else 0
+                q = q[left:len(q) - right]
+                record.query_qualities = pysam.qualitystring_to_array(q)
+            filtbam.write(record)
+
+
 def minimap2_f(
     reference: str, reads: list, cpus: str, sorted_outbf, mmk: str = "500M",
-    mmp: str = "sr", minal: int = 100
+    mmp: str = "sr", minal: int = 100, collapsed: dict = None
     ) -> str:
 
     '''
@@ -391,9 +504,18 @@ def minimap2_f(
         mmk: -K parameter for minimap2
         mmp: str, minimap2 preset for sequencing tech
         minal: int, minimum alignment length to pass read-level filter.
+        collapsed: optional result of collapse_identical_reads(). The
+            representatives are mapped instead of `reads`, and every passing
+            alignment is written once per read it stands for, with that read's
+            name and qualities, so the BAM matches mapping all reads.
     Returns:
         sorted_outbf
     '''
+    if collapsed:
+        reads = collapsed["reads"]
+        members = _CollapsedMembers(collapsed)
+    else:
+        members = None
     
     map_command = ['minimap2', '-t', cpus, '-a']
 
@@ -429,6 +551,7 @@ def minimap2_f(
 
             outbf = sorted_outbf.replace('.sorted.bam', '.bam')
             filtbam = pysam.AlignmentFile(outbf, "wb", template=ministream)
+            group, group_name = [], None
 
             for record in ministream:
                 readLength: int = record.infer_read_length()
@@ -451,7 +574,17 @@ def minimap2_f(
 
                 if alignLength >= minal and alignProp >= 0.9 and alignAcc >= 0.8:
 
-                    filtbam.write(record)
+                    if members is None:
+                        filtbam.write(record)
+                    else:
+                        if record.query_name != group_name:
+                            if group:
+                                _write_expanded(filtbam, group, members(int(group_name)), collapsed["paired"])
+                            group, group_name = [], record.query_name
+                        group.append(record)
+
+            if group:
+                _write_expanded(filtbam, group, members(int(group_name)), collapsed["paired"])
 
     filtbam.close()
 
