@@ -1544,7 +1544,8 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
             ex_key = (total_reads.get(exemplar_candidate, 0), max_avg_identity.get(exemplar_candidate))
             tied = ",".join(sorted(
                 a for a in directly_connected
-                if a not in assigned and (total_reads.get(a, 0), max_avg_identity.get(a)) == ex_key))
+                if a != exemplar_candidate and a not in assigned
+                and (total_reads.get(a, 0), max_avg_identity.get(a)) == ex_key))
             
             # Add exemplar to cluster
             records.append({
