@@ -6,6 +6,7 @@ import json
 import tempfile
 import gzip
 import hashlib
+import array
 from subprocess import Popen, PIPE, STDOUT
 import sys, os
 import re
@@ -394,29 +395,27 @@ def _fastq_records(handle):
         yield header[1:].split(None, 1)[0], seq, qual
 
 
-def collapse_identical_reads(reads: list, tempdir: str, sample_name: str,
-                             reps_per_bucket: int = 100_000) -> dict:
+def collapse_identical_reads(reads: list, tempdir: str, sample_name: str) -> dict:
     """
     Write one representative per distinct read sequence (or read-pair sequence
-    pair) so it is mapped only once, and keep every read's name and base
-    qualities so expand_collapsed_record() can restore one alignment per read.
+    pair), so that it is mapped and processed only once, and a weight table with
+    how many reads each representative stands for.
 
     reads: one FASTQ (unpaired) or two (R1, R2), optionally gzipped.
-    Representatives are named by their index (0, 1, ...) in order of first
-    occurrence. The names and qualities of all reads (representative first)
-    are written to bucket files of `reps_per_bucket` representatives each, so
-    memory holds only one hash per distinct read and one bucket at a time.
+    Each representative keeps the name of the first read with its sequence, so
+    read-name based steps (e.g. optical duplicate detection) still work.
+    The weight table (<sample>.read_weights.tsv: name, copies) is written in
+    representative order; memory holds one hash and one counter per distinct read.
 
-    Returns a dict for minimap2_f(collapsed=...): reads (representative
-    FASTQs), buckets, reps_per_bucket, paired, n_reads, n_unique.
+    Returns a dict: reads (representative FASTQs), weights (path), paired,
+    n_reads, n_unique.
     """
     paired = len(reads) == 2
     os.makedirs(tempdir, exist_ok=True)
     out_paths = [os.path.join(tempdir, f"{sample_name}_R{i + 1}.unique.fastq") for i in range(len(reads))]
-    bucket_dir = os.path.join(tempdir, f"{sample_name}_collapsed_reads")
-    os.makedirs(bucket_dir, exist_ok=True)
-    buckets = []
+    weights_path = os.path.join(tempdir, f"{sample_name}.read_weights.tsv")
     rep_of = {}
+    copies = array.array("Q")
     n_reads = 0
     ins = [_open_text(p) for p in reads]
     outs = [open(p, "w") for p in out_paths]
@@ -427,70 +426,75 @@ def collapse_identical_reads(reads: list, tempdir: str, sample_name: str,
             key = hashlib.blake2b("\n".join(r[1] for r in recs).encode(), digest_size=16).digest()
             rep = rep_of.get(key)
             if rep is None:
-                rep = rep_of[key] = len(rep_of)
+                rep = rep_of[key] = len(copies)
+                copies.append(0)
+                name = recs[0][0]
+                if paired and name[-2:] in ("/1", "/2"):
+                    name = name[:-2]   # minimap2 strips /1 and /2 from paired read names
                 for (_name, seq, qual), out in zip(recs, outs):
-                    out.write(f"@{rep}\n{seq}\n+\n{qual}\n")
-            b = rep // reps_per_bucket
-            while len(buckets) <= b:
-                buckets.append(open(os.path.join(bucket_dir, f"{len(buckets):05d}.tsv"), "w"))
-            name = recs[0][0]
-            if paired and name[-2:] in ("/1", "/2"):
-                name = name[:-2]   # minimap2 strips /1 and /2 from paired read names
-            buckets[b].write(f"{rep}\t{name}\t" + "\t".join(r[2] for r in recs) + "\n")
+                    out.write(f"@{name}\n{seq}\n+\n{qual}\n")
+            copies[rep] += 1
         for extra in streams:
             if next(extra, None) is not None:
                 raise ValueError(f"read files {reads} have different numbers of reads")
     finally:
-        for h in ins + outs + buckets:
+        for h in ins + outs:
             h.close()
-    n_unique = len(rep_of)
+    del rep_of
+    # names in representative order, read back from the representative FASTQ
+    with open(out_paths[0]) as f, open(weights_path, "w") as w:
+        for i, (name, _seq, _qual) in enumerate(_fastq_records(f)):
+            w.write(f"{name}\t{copies[i]}\n")
+    n_unique = len(copies)
     logger.info(f"collapsed {n_reads} reads{' (pairs)' if paired else ''} to {n_unique} distinct sequences "
                 f"({100 * (1 - n_unique / n_reads) if n_reads else 0:.1f}% identical copies)")
-    return {"reads": out_paths, "buckets": [b.name for b in buckets], "reps_per_bucket": reps_per_bucket,
-            "paired": paired, "n_reads": n_reads, "n_unique": n_unique}
+    return {"reads": out_paths, "weights": weights_path, "paired": paired,
+            "n_reads": n_reads, "n_unique": n_unique}
 
 
-class _CollapsedMembers:
-    """Name and qualities of every read that a representative stands for; loads one bucket at a time."""
+def weighted_read_counts(bam_path: str, weights_path: str, out_weights: str = None) -> pl.DataFrame:
+    """
+    Weighted primary read counts per contig for a BAM of collapsed representatives.
 
-    def __init__(self, collapsed: dict):
-        self.c = collapsed
-        self.loaded = None
-        self.members = {}
+    Each primary alignment counts as many reads as its representative stands for
+    (weights_path from collapse_identical_reads), so read_count_weighted equals
+    the read_count of mapping every read, except that all copies of a read share
+    the representative's alignment. Only the weights of reads in the BAM are
+    held in memory. out_weights, if given, gets the weights of those reads
+    (name, copies) for later steps (e.g. duplicate counts).
 
-    def __call__(self, rep: int) -> list:
-        b = rep // self.c["reps_per_bucket"]
-        if b != self.loaded:
-            self.members = defaultdict(list)
-            with open(self.c["buckets"][b]) as f:
-                for line in f:
-                    fields = line.rstrip("\n").split("\t")
-                    self.members[int(fields[0])].append(fields[1:])
-            self.loaded = b
-        return self.members[rep]
-
-
-def _write_expanded(filtbam, group: list, members: list, paired: bool) -> None:
-    """Write the alignments of one representative once for every read it stands for,
-    with that read's name and base qualities (all records of a read stay adjacent)."""
-    for name, *quals in members:
-        for record in group:
-            record.query_name = name
-            if record.query_qualities is not None:
-                q = quals[1] if (paired and record.is_read2) else quals[0]
-                if record.is_reverse:
-                    q = q[::-1]
-                cig = record.cigartuples or []
-                left = cig[0][1] if cig and cig[0][0] == 5 else 0
-                right = cig[-1][1] if len(cig) > 1 and cig[-1][0] == 5 else 0
-                q = q[left:len(q) - right]
-                record.query_qualities = pysam.qualitystring_to_array(q)
-            filtbam.write(record)
+    Returns a polars DataFrame: Accession, read_count_weighted.
+    """
+    names = set()
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        for r in bam.fetch(until_eof=True):
+            if not r.is_unmapped and not r.is_secondary and not r.is_supplementary:
+                names.add(r.query_name)
+    w = {}
+    with open(weights_path) as f:
+        for line in f:
+            name, n = line.rstrip("\n").split("\t")
+            if name in names:
+                w[name] = int(n)
+    missing = names.difference(w)
+    if missing:
+        raise ValueError(f"{len(missing)} reads in {bam_path} have no weight in {weights_path}, e.g. {next(iter(missing))}")
+    counts = defaultdict(int)
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        for r in bam.fetch(until_eof=True):
+            if not r.is_unmapped and not r.is_secondary and not r.is_supplementary:
+                counts[r.reference_name] += w[r.query_name]
+    if out_weights:
+        with open(out_weights, "w") as f:
+            for name, n in w.items():
+                f.write(f"{name}\t{n}\n")
+    return pl.DataFrame({"Accession": list(counts), "read_count_weighted": list(counts.values())},
+                        schema={"Accession": pl.Utf8, "read_count_weighted": pl.Int64})
 
 
 def minimap2_f(
     reference: str, reads: list, cpus: str, sorted_outbf, mmk: str = "500M",
-    mmp: str = "sr", minal: int = 100, collapsed: dict = None
+    mmp: str = "sr", minal: int = 100
     ) -> str:
 
     '''
@@ -504,18 +508,9 @@ def minimap2_f(
         mmk: -K parameter for minimap2
         mmp: str, minimap2 preset for sequencing tech
         minal: int, minimum alignment length to pass read-level filter.
-        collapsed: optional result of collapse_identical_reads(). The
-            representatives are mapped instead of `reads`, and every passing
-            alignment is written once per read it stands for, with that read's
-            name and qualities, so the BAM matches mapping all reads.
     Returns:
         sorted_outbf
     '''
-    if collapsed:
-        reads = collapsed["reads"]
-        members = _CollapsedMembers(collapsed)
-    else:
-        members = None
     
     map_command = ['minimap2', '-t', cpus, '-a']
 
@@ -551,7 +546,6 @@ def minimap2_f(
 
             outbf = sorted_outbf.replace('.sorted.bam', '.bam')
             filtbam = pysam.AlignmentFile(outbf, "wb", template=ministream)
-            group, group_name = [], None
 
             for record in ministream:
                 readLength: int = record.infer_read_length()
@@ -574,17 +568,7 @@ def minimap2_f(
 
                 if alignLength >= minal and alignProp >= 0.9 and alignAcc >= 0.8:
 
-                    if members is None:
-                        filtbam.write(record)
-                    else:
-                        if record.query_name != group_name:
-                            if group:
-                                _write_expanded(filtbam, group, members(int(group_name)), collapsed["paired"])
-                            group, group_name = [], record.query_name
-                        group.append(record)
-
-            if group:
-                _write_expanded(filtbam, group, members(int(group_name)), collapsed["paired"])
+                    filtbam.write(record)
 
     filtbam.close()
 
@@ -1138,7 +1122,8 @@ def consensus_lca_taxonomy(
 ## Make the main table and assembly-based output table
 def assembly_table_maker(
     df1: pl.DataFrame, df2: pl.DataFrame, read_ani_df: pl.DataFrame,
-    filtered_reads: int, sample: str, adj_tax_df: pl.DataFrame = None) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    filtered_reads: int, sample: str, adj_tax_df: pl.DataFrame = None,
+    weighted_df: pl.DataFrame = None, weighted_reads: int = None) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
     Merge three polars DataFrames on 'Accession' and add an 'RPKMF' column.
     RPKMF = (read_count / (contig_length / 1000)) / (filtered_reads / 1e6)
@@ -1148,6 +1133,10 @@ def assembly_table_maker(
         read_ani_df: polars DataFrame (must have 'Accession' and any columns to merge)
         filtered_reads: total filtered reads (int)
         sample: sample_ID for run
+        weighted_df: optional (--collapse-duplicates) polars DataFrame with 'Accession' and
+            'read_count_weighted' (weighted_read_counts()); adds read_count_weighted and
+            RPKMF_weighted = (read_count_weighted / (contig_length / 1000)) / (weighted_reads / 1e6)
+        weighted_reads: filtered reads before collapsing (denominator of RPKMF_weighted)
     Returns:
         tuple of DataFrames, one summarized by accession, one by assembly.
     """
@@ -1162,6 +1151,13 @@ def assembly_table_maker(
         pl.col("mean_coverage").fill_null(strategy="zero"),
         pl.col("Pi").fill_null(strategy="zero")
         )
+    weighted = weighted_df is not None
+    wcols = ["read_count_weighted", "RPKMF_weighted"] if weighted else []
+    if weighted:
+        merged = merged.join(weighted_df, on="Accession", how="left").with_columns(
+            pl.col("read_count_weighted").fill_null(strategy="zero"))
+        merged = merged.with_columns(
+            (pl.col("read_count_weighted") / (pl.col("Length") / 1000) / (weighted_reads / 1e6)).alias("RPKMF_weighted"))
     # calculate/add more columns
     merged = merged.with_columns([
         (pl.col("read_count") / (pl.col("Length") / 1000) / (filtered_reads / 1e6)).alias("RPKMF"),
@@ -1211,7 +1207,7 @@ def assembly_table_maker(
         "Segment", "Accession", "Assembly",
         "Asm_length", "kingdom", "phylum", "tclass", "order",
         "family", "genus", "species", "subspecies", "adj_taxonomy", "RPKMF",
-        "read_count", "covered_bases", "mean_coverage", 
+        "read_count", *wcols, "covered_bases", "mean_coverage", 
         "avg_read_identity", "consensus_ref_identity", "Pi", "filtered_reads_in_sample"
     ]).sort([
         "family", "genus", "species", "Assembly", "Segment"
@@ -1227,6 +1223,7 @@ def assembly_table_maker(
     ).agg(
         # read_count
         pl.col("read_count").sum().alias("read_count"),
+        *([pl.col("read_count_weighted").sum().alias("read_count_weighted")] if weighted else []),
         #covered_bases
         pl.col("covered_bases").sum().alias("covered_bases"),
         # read ANI
@@ -1239,6 +1236,8 @@ def assembly_table_maker(
         pl.col("Segment"),
     ).with_columns(
         (pl.col("read_count") / (pl.col("Asm_length") / 1000) / (filtered_reads / 1e6)).alias("RPKMF"),
+        *([(pl.col("read_count_weighted") / (pl.col("Asm_length") / 1000) / (weighted_reads / 1e6)).alias("RPKMF_weighted")]
+          if weighted else []),
         pl.col("Accession").list.eval(pl.element().cast(pl.String)),
         pl.col("Segment").list.eval(pl.element().cast(pl.String))
     ).with_columns(
@@ -1468,6 +1467,8 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
     Only assemblies with direct connections to the exemplar are included in each cluster.
     Assemblies without direct connections to the exemplar are reclustered.
     Returns a polars DataFrame mapping each assembly to its cluster and exemplar.
+    exemplar_tied_with lists the cluster members that tie with the exemplar on both
+    read count and identity, i.e. the exemplar was chosen only by name order.
     """
 
     # Build graph representation with direct connections
@@ -1540,6 +1541,10 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
         if directly_connected:
             cluster_id = f"cluster_{next_cluster_id}"
             next_cluster_id += 1
+            ex_key = (total_reads.get(exemplar_candidate, 0), max_avg_identity.get(exemplar_candidate))
+            tied = ",".join(sorted(
+                a for a in directly_connected
+                if a not in assigned and (total_reads.get(a, 0), max_avg_identity.get(a)) == ex_key))
             
             # Add exemplar to cluster
             records.append({
@@ -1547,7 +1552,8 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
                 'assembly': exemplar_candidate,
                 'exemplar': exemplar_candidate,
                 'total_reads': total_reads.get(exemplar_candidate, 0),
-                'is_exemplar': True
+                'is_exemplar': True,
+                'exemplar_tied_with': tied
             })
             assigned.add(exemplar_candidate)
             
@@ -1559,7 +1565,8 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
                         'assembly': assembly,
                         'exemplar': exemplar_candidate,
                         'total_reads': total_reads.get(assembly, 0),
-                        'is_exemplar': False
+                        'is_exemplar': False,
+                        'exemplar_tied_with': tied
                     })
                     assigned.add(assembly)
         else:
@@ -1571,7 +1578,8 @@ def cluster_assemblies_by_read_sharing(df, threshold=0.33) -> pl.DataFrame:
                 'assembly': exemplar_candidate,
                 'exemplar': exemplar_candidate,
                 'total_reads': total_reads.get(exemplar_candidate, 0),
-                'is_exemplar': True
+                'is_exemplar': True,
+                'exemplar_tied_with': ""
             })
             assigned.add(exemplar_candidate)
         
@@ -1717,6 +1725,7 @@ def tax_profile(assem_df: pl.DataFrame, sp_cutoff: float = 0.90, subsp_cutoff: f
     ]).agg([
         pl.col("read_count").sum().alias("read_count"),
         pl.col("RPKMF").sum().alias("RPKMF"),
+        *[pl.col(c).sum().alias(c) for c in ("read_count_weighted", "RPKMF_weighted") if c in assem_df.columns],
         pl.col("avg_read_identity").mean().alias("avg_read_identity"),
         pl.col("consensus_ref_identity").mean().alias("consensus_ref_identity"),
         pl.col("Assembly").unique().alias("assembly_list")
