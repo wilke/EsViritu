@@ -160,10 +160,10 @@ def esviritu():
     optional_args.add_argument(
         "--collapse-duplicates",
         dest="COLLAPSE", type=esvf.str2bool, default=False,
-        help='True or False. Default: False. Map each distinct read (pair) sequence only once and \
-            copy its alignments to every identical read, with that read\'s name and qualities. \
-            Results are the same as without it; mapping is faster when many reads are identical. \
-            Not used for --read_format interleaved.'
+        help='True or False. Default: False. Collapse identical reads (pairs) to one representative \
+            with a copy-number weight, and run the pipeline on the representatives (like --dedup, \
+            but without losing the copy numbers). read_count/RPKMF then count distinct reads; \
+            read_count_weighted/RPKMF_weighted count all reads. Not used for --read_format interleaved.'
         )
     optional_args.add_argument(
         "--min-align-length",
@@ -400,6 +400,19 @@ def esviritu():
         else:
             collapse_fn = timed_function(logger=logger)(esvf.collapse_identical_reads)
             collapsed = collapse_fn(trim_filt_reads, str(args.TEMP_DIR), str(args.SAMPLE))
+            trim_filt_reads = collapsed["reads"]
+            # read_count/RPKMF now count distinct reads; RPKMF_weighted uses all filtered reads
+            weighted_reads = int(filtered_reads)
+            filtered_reads = collapsed["n_unique"] * (2 if collapsed["paired"] else 1)
+            try:
+                with open(out_readstats_yaml) as f:
+                    readstats = yaml.safe_load(f) or {}
+                readstats["reads for EsViritu denominator"] = filtered_reads
+                readstats["reads for EsViritu weighted denominator"] = weighted_reads
+                with open(out_readstats_yaml, "w") as f:
+                    yaml.dump(readstats, f, default_flow_style=False)
+            except Exception as e:
+                logger.warning(f"Could not add collapsed read counts to {out_readstats_yaml}: {e}")
 
     # map reads to virus DB and filter for good alignments
     init_bam_f = os.path.join(str(args.TEMP_DIR), f"{str(args.SAMPLE)}.initial.filt.sorted.bam")
@@ -411,8 +424,7 @@ def esviritu():
         init_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL),
-        collapsed
+        int(args.MINAL)
     )
 
     logger.info(f"initial bam: {initial_map_bam}")
@@ -484,8 +496,7 @@ def esviritu():
         sec_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL),
-        collapsed
+        int(args.MINAL)
     )
     require_alignments(second_map_bam, "second")
 
@@ -519,6 +530,22 @@ def esviritu():
         separator = "\t"
     )
 
+    # exemplars chosen only by name order (tied on read count and identity)
+    ties_schema = {"sample_ID": pl.Utf8, "exemplar": pl.Utf8, "total_reads": pl.Int64, "exemplar_tied_with": pl.Utf8}
+    if "exemplar_tied_with" in read_clust_sec_df.columns:
+        ties_df = read_clust_sec_df.filter(
+            pl.col("is_exemplar") & (pl.col("exemplar_tied_with") != "")
+        ).select(
+            pl.lit(str(args.SAMPLE)).alias("sample_ID"), "exemplar",
+            pl.col("total_reads").cast(pl.Int64), "exemplar_tied_with"
+        )
+    else:
+        ties_df = pl.DataFrame(schema=ties_schema)
+    ties_of = os.path.join(str(out_directory), f"{str(args.SAMPLE)}.exemplar_ties.tsv")
+    ties_df.write_csv(file = ties_of, separator = "\t")
+    if not ties_df.is_empty():
+        logger.warning(f"{ties_df.height} exemplar(s) chosen by name order among tied assemblies: {ties_of}")
+
     ## make new fasta file database from exemplars, attempt 2
     sec_clust_db_fasta = clust_record_getter_fn(
         sec_read_clust_of,
@@ -541,10 +568,19 @@ def esviritu():
         third_bam_f,
         str(args.MMK),
         str(args.MM_SET),
-        int(args.MINAL),
-        collapsed
+        int(args.MINAL)
     )
     require_alignments(third_map_bam, "third")
+
+    # copy-number weighted read counts of the final alignments
+    weighted_df = None
+    if collapsed:
+        weighted_read_counts_fn = timed_function(logger=logger)(esvf.weighted_read_counts)
+        weighted_df = weighted_read_counts_fn(
+            third_map_bam,
+            collapsed["weights"],
+            os.path.join(str(args.TEMP_DIR), f"{str(args.SAMPLE)}.third.read_weights.tsv")
+        )
 
     ## take third .bam, make final consensus .fastas
     sec_con_f = os.path.join(
@@ -633,7 +669,9 @@ def esviritu():
         read_ani_df,
         filtered_reads,
         str(args.SAMPLE),
-        adj_tax_df
+        adj_tax_df,
+        weighted_df,
+        weighted_reads if collapsed else None
     )
 
     main_of = os.path.join(
